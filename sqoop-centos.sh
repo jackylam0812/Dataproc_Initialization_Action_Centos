@@ -39,7 +39,7 @@ function main() {
 
   # Only run the installation on master nodes
   if [[ "${role}" == 'Master' ]]; then
-    execute_with_retries "yum install -y -q sqoop"
+    execute_with_retries "yum update -y && yum install -y -q sqoop"
     # Sqoop will use locally available MySQL JDBC driver
     ln -s "${MYSQL_JAR}" "${SQOOP_HOME}/lib/mysql.jar"
   fi

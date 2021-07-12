@@ -28,6 +28,38 @@ set -euxo pipefail
 # Use Python from /usr/bin instead of /opt/conda.
 export PATH=/usr/bin:$PATH
 
+KMS_KEY_URI="$(/usr/share/google/get_metadata_value attributes/kms-key-uri || echo '')"
+readonly KMS_KEY_URI
+
+DB_ADMIN_USER="$(/usr/share/google/get_metadata_value attributes/db-admin-user || echo 'root')"
+readonly DB_ADMIN_USER
+
+HOSTNAME="$(/usr/share/google/get_metadata_value hostname || echo '')"
+readonly HOSTNAME
+
+FIRST_MASTER_NODE="m-0"
+
+# Database admin user password used to create the metastore database and user.
+DB_ADMIN_PASSWORD_URI="$(/usr/share/google/get_metadata_value attributes/db-admin-password-uri || echo '')"
+readonly DB_ADMIN_PASSWORD_URI
+if [[ -n "${DB_ADMIN_PASSWORD_URI}" ]]; then
+  # Decrypt password
+  DB_ADMIN_PASSWORD="$(gsutil cat "${DB_ADMIN_PASSWORD_URI}" |
+    gcloud kms decrypt \
+      --ciphertext-file - \
+      --plaintext-file - \
+      --key "${KMS_KEY_URI}")"
+  readonly DB_ADMIN_PASSWORD
+else
+  readonly DB_ADMIN_PASSWORD=''
+fi
+if [[ -z ${DB_ADMIN_PASSWORD} ]]; then
+  readonly DB_ADMIN_PASSWORD_PARAMETER=''
+else
+  DB_ADMIN_PASSWORD_PARAMETER="-p${DB_ADMIN_PASSWORD}"
+  readonly DB_ADMIN_PASSWORD_PARAMETER
+fi
+
 function retry_apt_command() {
   local cmd="$1"
   for ((i = 0; i < 10; i++)); do
@@ -48,7 +80,7 @@ function install_oozie() {
   master_node=$(/usr/share/google/get_metadata_value attributes/dataproc-master)
 
   # Upgrade the repository and install Oozie
-  # retry_apt_command "yum update -y"
+  retry_apt_command "yum update -y"
   retry_apt_command "yum install -q -y oozie oozie-client"
 
   # For Oozie, remove Log4j 2 jar not compatible with Log4j 1 that was brought by Hive 2
@@ -106,6 +138,41 @@ function install_oozie() {
     rm -rf "${tmp_dir}"
   fi
 
+
+    OOZIE_PASSWORD='oozie-password'
+
+    # Create a database, give 'oozie' user permissions
+    if [[ ${HOSTNAME} =~ ${FIRST_MASTER_NODE} ]];then
+    mysql -u root "${DB_ADMIN_PASSWORD_PARAMETER}" -e "
+        CREATE DATABASE IF NOT EXISTS oozie;
+        CREATE USER IF NOT EXISTS 'oozie' IDENTIFIED BY '${OOZIE_PASSWORD}';
+        GRANT ALL PRIVILEGES ON oozie.* TO 'oozie';" ||
+    err "Unable to create database"
+    fi
+
+  cat << EOF > db_configuration.txt
+    <property>
+        <name>oozie.service.JPAService.jdbc.driver</name>
+        <value>com.mysql.jdbc.Driver</value>
+    </property>
+    <property>
+        <name>oozie.service.JPAService.jdbc.url</name>
+        <value>jdbc:mysql://127.0.0.1:3306/oozie</value>
+    </property>
+    <property>
+        <name>oozie.service.JPAService.jdbc.username</name>
+        <value>oozie</value>
+    </property>
+    <property>
+        <name>oozie.service.JPAService.jdbc.password</name>
+        <value>oozie-password</value>
+    </property>
+EOF
+
+  sed -i '91 r db_configuration.txt' /etc/oozie/conf/oozie-site.xml
+  
+  cp /usr/share/java/mysql-connector-java.jar /var/lib/oozie/
+
   # Create the Oozie database
   sudo -u oozie /usr/lib/oozie/bin/ooziedb.sh create -run
 
@@ -136,7 +203,7 @@ function install_oozie() {
     --name 'fs.AbstractFileSystem.gs.impl' \
     --value 'com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS' \
     --clobber
-  
+
   local gcs_connector_dir="/usr/local/share/google/dataproc/lib"
   if [[ ! -d $gcs_connector_dir ]]; then
     gcs_connector_dir="/usr/lib/hadoop/lib"
